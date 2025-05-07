@@ -1,0 +1,389 @@
+//tagar6mei2025
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+#include <UniversalTelegramBot.h>
+#include <WiFiClientSecure.h>
+
+// Konfigurasi WiFi
+const char* ssid = "UMM-ICT";
+const char* password = "UMM.1964";
+
+// Konfigurasi MQTT
+const char* mqtt_server = "10.10.11.27";
+const char* mqtt_topic = "suhu2";
+
+// Konfigurasi Telegram
+#define BOTtoken "7387006946:AAHxNmWSqqOqUsbUPAxwSptd4e5Zj5qd01U"
+#define CHAT_ID "-1001186268872"  // Untuk notifikasi alert khusus
+
+// Konfigurasi WhatsApp CallMeBot
+const String whatsappNumbers[] = {
+  "6282229991796",  // tagar
+  "6285232851538",  // balya
+  "6282284029002",  // ardi
+  "6281540089927",  // abbit
+  "6285326233576",  // awan
+  "6285655522801",  // hasan
+  "6281234290701",  // abdi
+  "6282143637572",  // yasir
+  "6289509483305",  // amin
+};
+const String whatsappApiKeys[] = {
+  "3444775",        // tagar
+  "6498776",        // balya
+  "6210029",        // ardi
+  "8300770",        // abbit
+  "2746693",        // awan
+  "4543249",        // hasan
+  "9292526",        // abdi
+  "4994888",        // yasir
+  "9895757",        // amin
+};
+const int whatsappCount = 9;
+
+// Pin
+#define DHTPIN D5
+#define LED_MERAH D0
+#define LED_HIJAU D1
+#define BUZZER D2
+
+// Tipe DHT
+#define DHTTYPE DHT11
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+DHT dht(DHTPIN, DHTTYPE);
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOTtoken, secured_client);
+
+unsigned long lastMsg = 0;
+unsigned long lastTelegramCheck = 0;
+unsigned long lastAlertTime = 0;
+unsigned long lastWhatsAppAlert = 0;
+bool buzzerState = false;
+bool tempAlertActive = false;
+bool humAlertActive = false;
+bool normalConditionSent = true;
+float lastTemp = 0;
+float lastHumidity = 0;
+
+void setup_wifi() {
+  delay(10);
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("NodeMCUClient2")) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+    String from_name = bot.messages[i].from_name;
+    
+    // Debugging info - tambahkan ini
+    Serial.println("\n=== Debugging Info ===");
+    Serial.println("Chat ID: " + chat_id);
+    Serial.println("From: " + from_name);
+    Serial.println("Text: " + text);
+    
+    // Mendapatkan tipe chat (private/group/supergroup)
+    String chat_type;
+    if (chat_id.startsWith("-100")) {
+      Serial.println("Ini adalah supergroup");
+    } else if (chat_id.startsWith("-")) {
+      Serial.println("Ini adalah group biasa"); 
+    } else {
+      Serial.println("Ini adalah private chat");
+    }
+    
+    Serial.println("Chat Type: " + chat_type);
+    Serial.println("=====================");
+
+    if (text == "/start" || text == "/start@DivjarSuhu2_bot") {
+      String welcomeMsg = "🤖 *Selamat datang di Bot Monitoring Suhu Ruang UPS* 🤖\n\n";
+      welcomeMsg += "Halo " + from_name + "!\n";
+      welcomeMsg += "Saya adalah bot yang memantau suhu dan kelembapan ruang UPS secara real-time.\n\n";
+      welcomeMsg += "📋 *Perintah yang tersedia:*\n";
+      welcomeMsg += "/suhu2 - Tampilkan data suhu & kelembapan terkini\n";
+      welcomeMsg += "/start - Tampilkan pesan bantuan ini\n\n";
+      welcomeMsg += "💡 *Informasi:*\n";
+      welcomeMsg += "• Notifikasi akan dikirim otomatis saat kondisi tidak normal\n";
+      welcomeMsg += "• Status LED:\n";
+      welcomeMsg += "  🟢 Hijau: Kondisi normal\n";
+      welcomeMsg += "  🔴 Merah + 🚨: Kondisi tidak normal\n\n";
+      welcomeMsg += "Silakan gunakan perintah /suhu2 untuk memantau kondisi terkini.";
+      
+      bot.sendMessage(chat_id, welcomeMsg, "Markdown");
+    }
+    else if (text == "/suhu2" || text == "/suhu2@DivjarSuhu2_bot") {
+      float h = dht.readHumidity();
+      float t = dht.readTemperature();
+      
+      if (isnan(h) || isnan(t)) {
+        bot.sendMessage(chat_id, "❌ Gagal membaca sensor DHT11!", "");
+      } else {
+        String message = "📊 *Data Monitoring Suhu Ruang UPS*\n\n";
+        message += "🌡️ Suhu saat ini: " + String(t) + "°C\n";
+        message += "💧 Kelembapan: " + String(h) + "%\n";
+        message += "🕒 " + getTimeStamp() + "\n\n";
+        
+        if (t > 25) {
+          message += "🚨 *STATUS SUHU:* TIDAK NORMAL! (Melebihi 25°C)\n";
+        }
+        if (h > 90) {
+          message += "🚨 *STATUS KELEMBAPAN:* TIDAK NORMAL! (Melebihi 90%)\n";
+        }
+        if (t <= 25 && h <= 90) {
+          message += "✅ *STATUS:* NORMAL\n";
+        }
+        
+        message += "\nℹ️ Ketik /start untuk melihat menu bantuan";
+        
+        bot.sendMessage(chat_id, message, "Markdown");
+      }
+    }
+  }
+}
+
+void sendWhatsAppMessage(const String &message) {
+  WiFiClient client;
+  HTTPClient http;
+  
+  for (int i = 0; i < whatsappCount; i++) {
+    String url = "http://api.callmebot.com/whatsapp.php?phone=" + whatsappNumbers[i] + 
+                 "&text=" + urlEncode(message) + "&apikey=" + whatsappApiKeys[i];
+    
+    if (http.begin(client, url)) {
+      int httpCode = http.GET();
+      if (httpCode > 0) {
+        Serial.printf("WhatsApp sent to %s, status: %d\n", whatsappNumbers[i].c_str(), httpCode);
+      } else {
+        Serial.printf("WhatsApp failed to %s, error: %s\n", whatsappNumbers[i].c_str(), http.errorToString(httpCode).c_str());
+      }
+      http.end();
+    } else {
+      Serial.println("WhatsApp connection failed");
+    }
+    delay(1000);
+  }
+}
+
+String urlEncode(const String &str) {
+  String encodedString = "";
+  char c;
+  char code0;
+  char code1;
+  
+  for (unsigned int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (c == ' ') {
+      encodedString += '+';
+    } else if (isalnum(c)) {
+      encodedString += c;
+    } else {
+      code1 = (c & 0xf) + '0';
+      if ((c & 0xf) > 9) {
+        code1 = (c & 0xf) - 10 + 'A';
+      }
+      c = (c >> 4) & 0xf;
+      code0 = c + '0';
+      if (c > 9) {
+        code0 = c - 10 + 'A';
+      }
+      encodedString += '%';
+      encodedString += code0;
+      encodedString += code1;
+    }
+  }
+  return encodedString;
+}
+
+void sendTempAlert(float t, float h) {
+  String alertMsg = "🔥 *AWAS!! R. UPS PANAS* 🔥\n\n";
+  alertMsg += "🌡️ Suhu: " + String(t) + "°C (Melebihi 25°C)\n";
+  alertMsg += "💧 Kelembapan: " + String(h) + "%\n";
+  alertMsg += "🕒 " + getTimeStamp() + "\n\n";
+  alertMsg += "⚠️ Segera lakukan pengecekan!";
+  
+  bot.sendMessage(CHAT_ID, alertMsg, "Markdown");
+}
+
+void sendHumidityAlert(float t, float h) {
+  String alertMsg = "💧 *AWAS!! R. UPS LEMBAB* 💧\n\n";
+  alertMsg += "🌡️ Suhu: " + String(t) + "°C\n";
+  alertMsg += "💧 Kelembapan: " + String(h) + "% (Melebihi 90%)\n";
+  alertMsg += "🕒 " + getTimeStamp() + "\n\n";
+  alertMsg += "⚠️ Segera lakukan pengecekan!";
+  
+  bot.sendMessage(CHAT_ID, alertMsg, "Markdown");
+}
+
+void sendNormalCondition(float t, float h) {
+  String normalMsg = "✅ *SUHU DAN KELEMBAPAN RUANG UPS NORMAL KEMBALI* ✅\n\n";
+  normalMsg += "🌡️ Suhu: " + String(t) + "°C\n";
+  normalMsg += "💧 Kelembapan: " + String(h) + "%\n";
+  normalMsg += "🕒 " + getTimeStamp();
+  
+  bot.sendMessage(CHAT_ID, normalMsg, "Markdown");
+}
+
+String getTimeStamp() {
+  unsigned long seconds = millis() / 1000;
+  unsigned long minutes = seconds / 60;
+  unsigned long hours = minutes / 60;
+  unsigned long days = hours / 24;
+  seconds %= 60;
+  minutes %= 60;
+  hours %= 24;
+  
+  return String(hours) + ":" + (minutes < 10 ? "0" : "") + String(minutes) + ":" + (seconds < 10 ? "0" : "") + String(seconds);
+}
+
+void setup() {
+  pinMode(LED_MERAH, OUTPUT);
+  pinMode(LED_HIJAU, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(LED_MERAH, LOW);
+  digitalWrite(LED_HIJAU, LOW);
+  digitalWrite(BUZZER, LOW);
+  
+  Serial.begin(115200);
+  dht.begin();
+  setup_wifi();
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+
+  secured_client.setInsecure();
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+
+  unsigned long now = millis();
+  
+  // Baca sensor setiap 2 detik
+  if (now - lastMsg > 2000) {
+    lastMsg = now;
+    
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+    
+    if (isnan(h) || isnan(t)) {
+      Serial.println("❌ Gagal membaca sensor DHT11!");
+      return;
+    }
+    
+    lastTemp = t;
+    lastHumidity = h;
+    
+    Serial.print("Suhu: ");
+    Serial.print(t);
+    Serial.print(" °C || Kelembapan: ");
+    Serial.print(h);
+    Serial.println(" %");
+    
+    // Kirim data ke MQTT
+    String payload = "{\"suhu\":" + String(t) + ",\"kelembapan\":" + String(h) + "}";
+    client.publish(mqtt_topic, payload.c_str());
+    
+    // Kontrol LED dan buzzer
+    if (t > 25 || h > 90) {
+      digitalWrite(LED_HIJAU, LOW);
+      digitalWrite(LED_MERAH, HIGH);
+      digitalWrite(BUZZER, HIGH);
+      
+      if (t > 25) tempAlertActive = true;
+      if (h > 90) humAlertActive = true;
+      
+      if (!normalConditionSent) {
+        // Kirim notifikasi WhatsApp setiap 1 menit saat kondisi tidak normal
+        if (now - lastWhatsAppAlert > 60000) {
+          lastWhatsAppAlert = now;
+          if (t > 25 && h > 90) {
+            sendWhatsAppMessage("🔥💧 AWAS!! R. UPS PANAS DAN LEMBAB!\n🌡️Suhu: " + String(t) + "°C\n💧Kelembapan: " + String(h) + "%\n\n⚠️Silahkan Cek Telegram Untuk Kondisi Terkini \nhttps://t.me/DivjarSuhu2_bot");
+          } else if (t > 25) {
+            sendWhatsAppMessage("🔥 AWAS!! R. UPS PANAS! 🔥\n🌡️Suhu: " + String(t) + "°C\n\n⚠️Silahkan Cek Telegram Untuk Kondisi Terkini \nhttps://t.me/DivjarSuhu2_bot");
+          } else if (h > 90) {
+            sendWhatsAppMessage("💧 AWAS!! R. UPS LEMBAB! 💧\n💧Kelembapan: " + String(h) + "%\n\n⚠️Silahkan Cek Telegram Untuk Kondisi Terkini \nhttps://t.me/DivjarSuhu2_bot");
+          }
+        }
+      }
+      normalConditionSent = false;
+    } else {
+      digitalWrite(LED_HIJAU, HIGH);
+      digitalWrite(LED_MERAH, LOW);
+      digitalWrite(BUZZER, LOW);
+      
+      if ((tempAlertActive || humAlertActive) && !normalConditionSent) {
+        sendNormalCondition(t, h);
+        sendWhatsAppMessage("✅ SUHU DAN KELEMBAPAN RUANG UPS NORMAL KEMBALI ✅\nSuhu: " + String(t) + "°C\nKelembapan: " + String(h) + "%");
+        tempAlertActive = false;
+        humAlertActive = false;
+        normalConditionSent = true;
+      }
+    }
+  }
+  
+  // Kirim notifikasi Telegram setiap 1 detik jika kondisi tidak normal
+  if (millis() - lastAlertTime > 1000) {
+    lastAlertTime = millis();
+    
+    if (tempAlertActive) {
+      sendTempAlert(lastTemp, lastHumidity);
+    }
+    if (humAlertActive) {
+      sendHumidityAlert(lastTemp, lastHumidity);
+    }
+  }
+  
+  // Cek pesan Telegram setiap 1 detik
+  if (millis() - lastTelegramCheck > 1000) {
+    lastTelegramCheck = millis();
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+  }
+}
