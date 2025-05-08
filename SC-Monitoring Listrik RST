@@ -1,0 +1,533 @@
+//tagar8mei2025
+
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <PZEM004Tv30.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+
+// MQTT Configuration
+const char* mqtt_server = "10.10.11.27";
+const char* mqtt_topic = "listrik_noc";
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+// Konfigurasi WhatsApp CallMeBot
+const String whatsappNumbers[] = {
+  "6282229991796",  // tagar
+  "6285232851538",  // balya
+  "6282284029002",  // ardi
+  "6281540089927",  // abbit
+  "6285326233576",  // awan
+  "6285655522801",  // hasan
+  "6281234290701",  // abdi
+  "6282143637572",  // yasir
+  "6289509483305",  // amin
+};
+const String whatsappApiKeys[] = {
+  "3444775",        // tagar
+  "6498776",        // balya
+  "6210029",        // ardi
+  "8300770",        // abbit
+  "2746693",        // awan
+  "4543249",        // hasan
+  "9292526",        // abdi
+  "4994888",        // yasir
+  "9895757",        // amin
+};
+
+PZEM004Tv30 pzem1(D1, D2);   // GPIO4(D2) to Tx PZEM004; GPIO5(D1) to Rx PZEM004
+PZEM004Tv30 pzem2(D3, D4);   // GPIO2(D4) to Tx PZEM004; GPIO0(D3) to Rx PZEM004
+PZEM004Tv30 pzem3(D5, D6);   // GPIO12(D6) to Tx PZEM004; GPIO14(D5) to Rx PZEM004
+
+char ssid[] = "UMM-ICT";
+char pass[] = "UMM.1964";
+
+#define BOTtoken "6922228203:AAG5NEZAuySp0gkCjKEfmRH0w4Byd1kRklc"
+#define idChat   "-1001186268872"
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOTtoken, client);
+
+int botRequestDelay = 1000;
+unsigned long lastTimeBotRan;
+
+unsigned long lastMillis = 0;
+long interval = 2000;
+
+// Variables to track power status and notification state
+bool powerOutNotificationSentR = false;
+bool powerOutNotificationSentS = false;
+bool powerOutNotificationSentT = false;
+bool powerRestoredNotificationSentR = false;
+bool powerRestoredNotificationSentS = false;
+bool powerRestoredNotificationSentT = false;
+
+float voltage1, current1, power1, energy1, frequency1, pf1, va1, VAR1;
+float voltage2, current2, power2, energy2, frequency2, pf2, va2, VAR2;
+float voltage3, current3, power3, energy3, frequency3, pf3, va3, VAR3;
+float voltage3ph, current3ph, power3ph, energy3ph, frequency3ph, pf3ph, va3ph, VAR3ph;
+
+void setup() {
+  Serial.begin(115200);
+
+  client.setInsecure();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+
+  // Connect to WiFi
+  Serial.print("Connecting Wifi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, pass);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  } 
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize MQTT
+  mqttClient.setServer(mqtt_server, 1883);
+  mqttClient.setBufferSize(2048);
+  randomSeed(micros());
+
+  // Initialize time
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.println("Waiting for time sync...");
+  while (time(nullptr) < 100000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("Time synchronized");
+}
+
+void loop() {
+  // Reconnect to MQTT if connection is lost
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT disconnected. Attempting to reconnect...");
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
+  // Read sensor data
+  readSensorData();
+
+  // Calculate 3-phase values
+  calculate3PhaseValues();
+
+  // Handle Telegram bot messages
+  if (millis() > lastTimeBotRan + botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while(numNewMessages) {
+      Serial.println("got response");
+      handleNewMessages(numNewMessages, voltage1, voltage2, voltage3);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = millis();
+  }
+
+  // Check power status and send notifications
+  checkPowerStatus();
+
+  // Send data to MQTT
+  if(millis() - lastMillis > interval) {
+    sendToMQTT();
+    lastMillis = millis();
+  }
+}
+
+void readSensorData() {
+  voltage1 = zeroIfNan(pzem1.voltage());
+  current1 = zeroIfNan(pzem1.current());
+  power1 = zeroIfNan(pzem1.power());
+  energy1 = zeroIfNan(pzem1.energy());
+  frequency1 = zeroIfNan(pzem1.frequency());
+  pf1 = zeroIfNan(pzem1.pf());
+  va1 = (pf1 == 0) ? 0 : power1 / pf1;
+  VAR1 = (pf1 == 0) ? 0 : power1 / pf1 * sqrt(1-sq(pf1));
+
+  voltage2 = zeroIfNan(pzem2.voltage());
+  current2 = zeroIfNan(pzem2.current());
+  power2 = zeroIfNan(pzem2.power());
+  energy2 = zeroIfNan(pzem2.energy());
+  frequency2 = zeroIfNan(pzem2.frequency());
+  pf2 = zeroIfNan(pzem2.pf());
+  va2 = (pf2 == 0) ? 0 : power2 / pf2;
+  VAR2 = (pf2 == 0) ? 0 : power2 / pf2 * sqrt(1-sq(pf2));
+
+  voltage3 = zeroIfNan(pzem3.voltage());
+  current3 = zeroIfNan(pzem3.current());
+  power3 = zeroIfNan(pzem3.power());
+  energy3 = zeroIfNan(pzem3.energy());
+  frequency3 = zeroIfNan(pzem3.frequency());
+  pf3 = zeroIfNan(pzem3.pf());
+  va3 = (pf3 == 0) ? 0 : power3 / pf3;
+  VAR3 = (pf3 == 0) ? 0 : power3 / pf3 * sqrt(1-sq(pf3));
+}
+
+void calculate3PhaseValues() {
+  voltage3ph = sqrt(sq(voltage1) + sq(voltage2) + sq(voltage3));
+  
+  if (current1 > 0 && current2 > 0 && current3 > 0) {
+    current3ph = 0.3333 * (current1 + current2 + current3);
+  } else if (current1 == 0 && current2 > 0 && current3 > 0) {
+    current3ph = 0.5 * (current2 + current3);
+  } else if (current1 > 0 && current2 == 0 && current3 > 0) {
+    current3ph = 0.5 * (current1 + current3);
+  } else if (current1 > 0 && current2 > 0 && current3 == 0) {
+    current3ph = 0.5 * (current1 + current2);
+  } else if (current1 > 0 && current2 == 0 && current3 == 0) {
+    current3ph = current1;
+  } else if (current1 == 0 && current2 > 0 && current3 == 0) {
+    current3ph = current2;
+  } else if (current1 == 0 && current2 == 0 && current3 > 0) {
+    current3ph = current3;
+  } else {
+    current3ph = 0;
+  }
+
+  power3ph = (power1 + power2 + power3);
+  energy3ph = (energy1 + energy2 + energy3);
+  va3ph = (va1 + va2 + va3);
+  VAR3ph = (VAR1 + VAR2 + VAR3);
+
+  if (frequency1 > 0 && frequency2 > 0 && frequency3 > 0) {
+    frequency3ph = 0.3333 * (frequency1 + frequency2 + frequency3);
+  } else if (frequency1 > 0 && frequency2 > 0 && frequency3 == 0) {
+    frequency3ph = 0.5 * (frequency1 + frequency2);
+  } else if (frequency1 > 0 && frequency2 == 0 && frequency3 > 0) {
+    frequency3ph = 0.5 * (frequency1 + frequency3);
+  } else if (frequency1 == 0 && frequency2 > 0 && frequency3 > 0) {
+    frequency3ph = 0.5 * (frequency2 + frequency3);
+  } else if (frequency1 > 0 && frequency2 == 0 && frequency3 == 0) {
+    frequency3ph = frequency1;
+  } else if (frequency1 == 0 && frequency2 > 0 && frequency3 == 0) {
+    frequency3ph = frequency2;
+  } else if (frequency1 == 0 && frequency2 == 0 && frequency3 > 0) {
+    frequency3ph = frequency3;
+  } else {
+    frequency3ph = 0;
+  }
+
+  if (pf1 > 0 && pf2 > 0 && pf3 > 0) {
+    pf3ph = 0.3333 * (pf1 + pf2 + pf3);
+  } else if (pf1 > 0 && pf2 > 0 && pf3 == 0) {
+    pf3ph = 0.5 * (pf1 + pf2);
+  } else if (pf1 > 0 && pf2 == 0 && pf3 > 0) {
+    pf3ph = 0.5 * (pf1 + pf3);
+  } else if (pf1 == 0 && pf2 > 0 && pf3 > 0) {
+    pf3ph = 0.5 * (pf2 + pf3);
+  } else if (pf1 > 0 && pf2 == 0 && pf3 == 0) {
+    pf3ph = pf1;
+  } else if (pf1 == 0 && pf2 > 0 && pf3 == 0) {
+    pf3ph = pf2;
+  } else if (pf1 == 0 && pf2 == 0 && pf3 > 0) {
+    pf3ph = pf3;
+  } else {
+    pf3ph = 0;
+  }
+}
+
+void checkPowerStatus() {
+  // Check R phase
+  if (voltage1 < 100) {  // Power is out
+    if (!powerOutNotificationSentR) {
+      String statusMessage = getPowerStatusMessage("R", voltage1, "S", voltage2, "T", voltage3);
+      sendPowerOutNotification("R", statusMessage);
+      sendWhatsAppNotification(statusMessage, false);
+      powerOutNotificationSentR = true;
+      powerRestoredNotificationSentR = false;
+    }
+  } else {  // Power is back
+    if (powerOutNotificationSentR && !powerRestoredNotificationSentR) {
+      String statusMessage = getPowerStatusMessage("R", voltage1, "S", voltage2, "T", voltage3);
+      sendPowerRestoredNotification("R", statusMessage);
+      sendWhatsAppNotification(statusMessage, true);
+      powerRestoredNotificationSentR = true;
+      powerOutNotificationSentR = false;
+    }
+  }
+
+  // Check S phase
+  if (voltage2 < 100) {
+    if (!powerOutNotificationSentS) {
+      String statusMessage = getPowerStatusMessage("S", voltage2, "R", voltage1, "T", voltage3);
+      sendPowerOutNotification("S", statusMessage);
+      sendWhatsAppNotification(statusMessage, false);
+      powerOutNotificationSentS = true;
+      powerRestoredNotificationSentS = false;
+    }
+  } else {
+    if (powerOutNotificationSentS && !powerRestoredNotificationSentS) {
+      String statusMessage = getPowerStatusMessage("S", voltage2, "R", voltage1, "T", voltage3);
+      sendPowerRestoredNotification("S", statusMessage);
+      sendWhatsAppNotification(statusMessage, true);
+      powerRestoredNotificationSentS = true;
+      powerOutNotificationSentS = false;
+    }
+  }
+
+  // Check T phase
+  if (voltage3 < 100) {
+    if (!powerOutNotificationSentT) {
+      String statusMessage = getPowerStatusMessage("T", voltage3, "R", voltage1, "S", voltage2);
+      sendPowerOutNotification("T", statusMessage);
+      sendWhatsAppNotification(statusMessage, false);
+      powerOutNotificationSentT = true;
+      powerRestoredNotificationSentT = false;
+    }
+  } else {
+    if (powerOutNotificationSentT && !powerRestoredNotificationSentT) {
+      String statusMessage = getPowerStatusMessage("T", voltage3, "R", voltage1, "S", voltage2);
+      sendPowerRestoredNotification("T", statusMessage);
+      sendWhatsAppNotification(statusMessage, true);
+      powerRestoredNotificationSentT = true;
+      powerOutNotificationSentT = false;
+    }
+  }
+}
+
+String getPowerStatusMessage(String mainPhase, float mainVoltage, String phase1, float voltage1, String phase2, float voltage2) {
+  String message = "";
+  
+  // Status fase utama
+  message += "⚡️ Fase " + mainPhase + ": " + String(mainVoltage, 1) + " V\n";
+  
+  // Status fase lainnya
+  message += "⚡️ Fase " + phase1 + ": " + String(voltage1, 1) + " V\n";
+  message += "⚡️ Fase " + phase2 + ": " + String(voltage2, 1) + " V\n";
+  
+  // Total daya 3 fase
+  message += "🔌 Total Daya: " + String(power1 + power2 + power3, 1) + " W\n";
+  
+  return message;
+}
+
+void sendPowerOutNotification(String phase, String message) {
+  bot.sendChatAction(idChat, "Sedang mengetik...");
+  String fullMessage = "⚠️ LISTRIK PADAM! ⚠️\n";
+  fullMessage += "Fase " + phase + " mengalami pemadaman\n\n";
+  fullMessage += message;
+  bot.sendMessage(idChat, fullMessage, "");
+}
+
+void sendPowerRestoredNotification(String phase, String message) {
+  bot.sendChatAction(idChat, "Sedang mengetik...");
+  String fullMessage = "✅ LISTRIK KEMBALI NORMAL ✅\n";
+  fullMessage += "Fase " + phase + " telah pulih\n\n";
+  fullMessage += message;
+  bot.sendMessage(idChat, fullMessage, "");
+}
+
+void sendWhatsAppNotification(String message, bool restored) {
+  String fullMessage;
+  if (restored) {
+    fullMessage = "✅ LISTRIK KEMBALI NORMAL ✅\n\n";
+  } else {
+    fullMessage = "⚠️ LISTRIK PADAM! ⚠️\n\n";
+  }
+  fullMessage += message;
+  fullMessage += "\n🕒 " + getCurrentTime();
+
+  // Send to all WhatsApp numbers
+  for (int i = 0; i < sizeof(whatsappNumbers)/sizeof(whatsappNumbers[0]); i++) {
+    sendToWhatsApp(whatsappNumbers[i], whatsappApiKeys[i], fullMessage);
+    delay(2000); // Delay lebih panjang antara pengiriman
+  }
+}
+
+String getCurrentTime() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo;
+  timeinfo = localtime(&now);
+  
+  char timeString[20];
+  strftime(timeString, sizeof(timeString), "%H:%M:%S %d/%m/%Y", timeinfo);
+  return String(timeString);
+}
+
+void sendToWhatsApp(String phoneNumber, String apiKey, String message) {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure client;
+    HTTPClient https;
+    
+    client.setInsecure();
+    
+    String encodedMessage = urlEncode(message);
+    
+    String url = "https://api.callmebot.com/whatsapp.php?phone=" + phoneNumber + 
+                 "&text=" + encodedMessage + "&apikey=" + apiKey;
+    
+    Serial.println("Attempting to connect to: " + url);
+    
+    if (https.begin(client, url)) {
+      int httpCode = https.GET();
+      
+      if (httpCode > 0) {
+        String payload = https.getString();
+        Serial.println("WhatsApp notification sent to " + phoneNumber);
+        Serial.println("Response code: " + String(httpCode));
+        Serial.println("Response: " + payload);
+      } else {
+        Serial.println("Error sending WhatsApp notification to " + phoneNumber);
+        Serial.println("HTTP error code: " + String(httpCode));
+        Serial.println("Error: " + https.errorToString(httpCode));
+      }
+      
+      https.end();
+    } else {
+      Serial.println("Unable to begin HTTPS connection");
+    }
+  } else {
+    Serial.println("WiFi not connected, cannot send WhatsApp notification");
+  }
+}
+
+String urlEncode(String str) {
+  String encodedString = "";
+  char c;
+  char code0;
+  char code1;
+  
+  for (unsigned int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    
+    if (c == ' ') {
+      encodedString += '+';
+    } else if (isalnum(c)) {
+      encodedString += c;
+    } else {
+      code1 = (c & 0xf) + '0';
+      if ((c & 0xf) > 9) {
+        code1 = (c & 0xf) - 10 + 'A';
+      }
+      c = (c >> 4) & 0xf;
+      code0 = c + '0';
+      if (c > 9) {
+        code0 = c - 10 + 'A';
+      }
+      encodedString += '%';
+      encodedString += code0;
+      encodedString += code1;
+    }
+  }
+  return encodedString;
+}
+
+void sendToMQTT() {
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+    delay(100);
+  }
+  
+  DynamicJsonDocument doc(2048);
+  
+  doc["phase_r"] = voltage1;
+  doc["phase_s"] = voltage2;
+  doc["phase_t"] = voltage3;
+  
+  doc["current_r"] = current1;
+  doc["current_s"] = current2;
+  doc["current_t"] = current3;
+  
+  doc["power_r"] = power1;
+  doc["power_s"] = power2;
+  doc["power_t"] = power3;
+  
+  doc["energy_r"] = energy1;
+  doc["energy_s"] = energy2;
+  doc["energy_t"] = energy3;
+  
+  doc["frequency_r"] = frequency1;
+  doc["frequency_s"] = frequency2;
+  doc["frequency_t"] = frequency3;
+  
+  doc["pf_r"] = pf1;
+  doc["pf_s"] = pf2;
+  doc["pf_t"] = pf3;
+  
+  doc["va_r"] = va1;
+  doc["va_s"] = va2;
+  doc["va_t"] = va3;
+  
+  doc["var_r"] = VAR1;
+  doc["var_s"] = VAR2;
+  doc["var_t"] = VAR3;
+  
+  // Data 3 phase
+  doc["voltage_3ph"] = voltage3ph;
+  doc["current_3ph"] = current3ph;
+  doc["power_3ph"] = power3ph;
+  doc["energy_3ph"] = energy3ph;
+  doc["frequency_3ph"] = frequency3ph;
+  doc["pf_3ph"] = pf3ph;
+  doc["va_3ph"] = va3ph;
+  doc["var_3ph"] = VAR3ph;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  if (mqttClient.publish(mqtt_topic, payload.c_str(), false)) {
+    Serial.println("MQTT message published successfully");
+    Serial.println(payload);
+  } else {
+    Serial.println("Failed to publish MQTT message. State: " + String(mqttClient.state()));
+  }
+}
+
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    
+    String clientId = "ESP8266Client-";
+    clientId += String(random(0xffff), HEX);
+    
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("connected");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" try again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+float zeroIfNan(float v) {
+  return isnan(v) ? 0 : v;
+}
+
+void handleNewMessages(int numNewMessages, float v1, float v2, float v3) {
+  Serial.println("handleNewMessages");
+  Serial.println(String(numNewMessages));
+
+  for (int i=0; i<numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+    String from_name = bot.messages[i].from_name;
+    if (from_name == "") from_name = "Guest";
+ 
+    if (text == "/listrik") {
+      String temp = "● Listrik NOC :\n";
+      temp += "⚡️ 🆁 : " + String(int(v1)) + " V\n";
+      temp += "⚡️ 🆂 : " + String(int(v2)) + " V\n";
+      temp += "⚡️ 🆃 : " + String(int(v3)) + " V\n";
+      bot.sendMessage(chat_id, temp, "");
+    }
+
+    if (text == "/start") {
+      String welcome = "Hi " + from_name + ", pilih pengecekan:\n";
+      welcome += "⚡️ /listrik  (Status Listrik)\n";
+      bot.sendMessage(chat_id, welcome, "");
+    }
+  }
+}
