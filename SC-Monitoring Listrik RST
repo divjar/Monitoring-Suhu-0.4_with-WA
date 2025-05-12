@@ -1,4 +1,4 @@
-//tagar8mei2025
+//tagar12052025
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
@@ -9,89 +9,102 @@
 #include <ArduinoJson.h>
 #include <time.h>
 
+// Pin Definitions
+#define BUZZER_PIN D0
+#define LED_RED_PIN D7
+#define LED_GREEN_PIN D8
+
 // MQTT Configuration
 const char* mqtt_server = "10.10.11.27";
 const char* mqtt_topic = "listrik_noc";
+const char* mqtt_status_topic = "listrik_noc/status";
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-// Konfigurasi WhatsApp CallMeBot
+// WhatsApp CallMeBot Configuration
 const String whatsappNumbers[] = {
-  "6282229991796",  // tagar
-  "6285232851538",  // balya
-  "6282284029002",  // ardi
-  "6281540089927",  // abbit
-  "6285326233576",  // awan
-  "6285655522801",  // hasan
-  "6281234290701",  // abdi
-  "6282143637572",  // yasir
-  "6289509483305",  // amin
+  "6282229991796"  // tagar
 };
 const String whatsappApiKeys[] = {
-  "3444775",        // tagar
-  "6498776",        // balya
-  "6210029",        // ardi
-  "8300770",        // abbit
-  "2746693",        // awan
-  "4543249",        // hasan
-  "9292526",        // abdi
-  "4994888",        // yasir
-  "9895757",        // amin
+  "3444775"        // tagar
 };
 
-PZEM004Tv30 pzem1(D1, D2);   // GPIO4(D2) to Tx PZEM004; GPIO5(D1) to Rx PZEM004
-PZEM004Tv30 pzem2(D3, D4);   // GPIO2(D4) to Tx PZEM004; GPIO0(D3) to Rx PZEM004
-PZEM004Tv30 pzem3(D5, D6);   // GPIO12(D6) to Tx PZEM004; GPIO14(D5) to Rx PZEM004
+// PZEM Sensors
+PZEM004Tv30 pzem1(D1, D2);   // GPIO5(D1) to Rx, GPIO4(D2) to Tx
+PZEM004Tv30 pzem2(D3, D4);   // GPIO0(D3) to Rx, GPIO2(D4) to Tx
+PZEM004Tv30 pzem3(D5, D6);   // GPIO14(D5) to Rx, GPIO12(D6) to Tx
 
-char ssid[] = "UMM-ICT";
-char pass[] = "UMM.1964";
+// WiFi Configuration
+const char* ssid = "UMM-ICT";
+const char* password = "UMM.1964";
 
+// Telegram Configuration
 #define BOTtoken "6922228203:AAG5NEZAuySp0gkCjKEfmRH0w4Byd1kRklc"
-#define idChat   "-1001186268872"
+#define idChat   "1138557293"
 
 WiFiClientSecure client;
 UniversalTelegramBot bot(BOTtoken, client);
 
-int botRequestDelay = 1000;
-unsigned long lastTimeBotRan;
+// Timing Variables
+unsigned long lastSensorRead = 0;
+unsigned long lastMQTTSend = 0;
+unsigned long lastBotCheck = 0;
+unsigned long lastPowerOutNotify = 0;
+unsigned long lastMqttBlink = 0;
+unsigned long lastBuzzerToggle = 0;
+const long sensorInterval = 1000;    // Read sensors every 1 second
+const long mqttInterval = 2000;     // Send to MQTT every 2 seconds
+const long botInterval = 1000;      // Check Telegram every 1 second
+const long powerOutNotifyInterval = 1000; // Notify every 1 second during outage
+const long mqttBlinkInterval = 500; // MQTT status blink interval
 
-unsigned long lastMillis = 0;
-long interval = 2000;
+// Power Status Tracking
+bool powerOutNotificationSent[3] = {false, false, false};
+bool powerRestoredNotificationSent[3] = {false, false, false};
+bool mqttConnected = false;
+bool lastMqttState = false;
+bool buzzerState = false;
 
-// Variables to track power status and notification state
-bool powerOutNotificationSentR = false;
-bool powerOutNotificationSentS = false;
-bool powerOutNotificationSentT = false;
-bool powerRestoredNotificationSentR = false;
-bool powerRestoredNotificationSentS = false;
-bool powerRestoredNotificationSentT = false;
+// Sensor Data
+struct PhaseData {
+  float voltage;
+  float current;
+  float power;
+  float energy;
+  float frequency;
+  float pf;
+  float va;
+  float VAR;
+};
 
-float voltage1, current1, power1, energy1, frequency1, pf1, va1, VAR1;
-float voltage2, current2, power2, energy2, frequency2, pf2, va2, VAR2;
-float voltage3, current3, power3, energy3, frequency3, pf3, va3, VAR3;
-float voltage3ph, current3ph, power3ph, energy3ph, frequency3ph, pf3ph, va3ph, VAR3ph;
+PhaseData phases[3];
+PhaseData threePhase;
+float totalPower = 0;
+bool powerOutage = false;
 
 void setup() {
   Serial.begin(115200);
+  
+  // Initialize GPIOs
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_RED_PIN, LOW);
+  digitalWrite(LED_GREEN_PIN, HIGH); // Start with green LED on
 
   client.setInsecure();
 
   WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
-
-  // Connect to WiFi
-  Serial.print("Connecting Wifi: ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, pass);
+  WiFi.begin(ssid, password);
   
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(500);
-  } 
-
-  Serial.println("");
-  Serial.println("WiFi connected");
+    digitalWrite(LED_GREEN_PIN, !digitalRead(LED_GREEN_PIN));
+  }
+  Serial.println("\nWiFi connected");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 
@@ -111,381 +124,343 @@ void setup() {
 }
 
 void loop() {
-  // Reconnect to MQTT if connection is lost
-  if (!mqttClient.connected()) {
-    Serial.println("MQTT disconnected. Attempting to reconnect...");
-    reconnectMQTT();
+  unsigned long currentMillis = millis();
+
+  // Read sensor data periodically
+  if (currentMillis - lastSensorRead >= sensorInterval) {
+    readSensorData();
+    calculate3PhaseValues();
+    checkPowerStatus();
+    lastSensorRead = currentMillis;
   }
+
+  // Send to MQTT periodically
+  if (currentMillis - lastMQTTSend >= mqttInterval) {
+    if (!mqttClient.connected()) {
+      reconnectMQTT();
+    } else {
+      sendCompleteDataToMQTT();
+    }
+    lastMQTTSend = currentMillis;
+  }
+
+  // Check Telegram messages
+  if (currentMillis - lastBotCheck >= botInterval) {
+    checkTelegramMessages();
+    lastBotCheck = currentMillis;
+  }
+
+  // Handle MQTT loop
   mqttClient.loop();
 
-  // Read sensor data
-  readSensorData();
-
-  // Calculate 3-phase values
-  calculate3PhaseValues();
-
-  // Handle Telegram bot messages
-  if (millis() > lastTimeBotRan + botRequestDelay) {
-    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-    while(numNewMessages) {
-      Serial.println("got response");
-      handleNewMessages(numNewMessages, voltage1, voltage2, voltage3);
-      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
-    }
-    lastTimeBotRan = millis();
-  }
-
-  // Check power status and send notifications
-  checkPowerStatus();
-
-  // Send data to MQTT
-  if(millis() - lastMillis > interval) {
-    sendToMQTT();
-    lastMillis = millis();
-  }
+  // Update status indicators
+  updateStatusIndicators();
 }
 
 void readSensorData() {
-  voltage1 = zeroIfNan(pzem1.voltage());
-  current1 = zeroIfNan(pzem1.current());
-  power1 = zeroIfNan(pzem1.power());
-  energy1 = zeroIfNan(pzem1.energy());
-  frequency1 = zeroIfNan(pzem1.frequency());
-  pf1 = zeroIfNan(pzem1.pf());
-  va1 = (pf1 == 0) ? 0 : power1 / pf1;
-  VAR1 = (pf1 == 0) ? 0 : power1 / pf1 * sqrt(1-sq(pf1));
+  // Phase 1 (R)
+  phases[0].voltage = zeroIfNan(pzem1.voltage());
+  phases[0].current = zeroIfNan(pzem1.current());
+  phases[0].power = zeroIfNan(pzem1.power());
+  phases[0].energy = zeroIfNan(pzem1.energy());
+  phases[0].frequency = zeroIfNan(pzem1.frequency());
+  phases[0].pf = zeroIfNan(pzem1.pf());
+  phases[0].va = (phases[0].pf == 0) ? 0 : phases[0].power / phases[0].pf;
+  phases[0].VAR = (phases[0].pf == 0) ? 0 : phases[0].power / phases[0].pf * sqrt(1-sq(phases[0].pf));
 
-  voltage2 = zeroIfNan(pzem2.voltage());
-  current2 = zeroIfNan(pzem2.current());
-  power2 = zeroIfNan(pzem2.power());
-  energy2 = zeroIfNan(pzem2.energy());
-  frequency2 = zeroIfNan(pzem2.frequency());
-  pf2 = zeroIfNan(pzem2.pf());
-  va2 = (pf2 == 0) ? 0 : power2 / pf2;
-  VAR2 = (pf2 == 0) ? 0 : power2 / pf2 * sqrt(1-sq(pf2));
+  // Phase 2 (S)
+  phases[1].voltage = zeroIfNan(pzem2.voltage());
+  phases[1].current = zeroIfNan(pzem2.current());
+  phases[1].power = zeroIfNan(pzem2.power());
+  phases[1].energy = zeroIfNan(pzem2.energy());
+  phases[1].frequency = zeroIfNan(pzem2.frequency());
+  phases[1].pf = zeroIfNan(pzem2.pf());
+  phases[1].va = (phases[1].pf == 0) ? 0 : phases[1].power / phases[1].pf;
+  phases[1].VAR = (phases[1].pf == 0) ? 0 : phases[1].power / phases[1].pf * sqrt(1-sq(phases[1].pf));
 
-  voltage3 = zeroIfNan(pzem3.voltage());
-  current3 = zeroIfNan(pzem3.current());
-  power3 = zeroIfNan(pzem3.power());
-  energy3 = zeroIfNan(pzem3.energy());
-  frequency3 = zeroIfNan(pzem3.frequency());
-  pf3 = zeroIfNan(pzem3.pf());
-  va3 = (pf3 == 0) ? 0 : power3 / pf3;
-  VAR3 = (pf3 == 0) ? 0 : power3 / pf3 * sqrt(1-sq(pf3));
+  // Phase 3 (T)
+  phases[2].voltage = zeroIfNan(pzem3.voltage());
+  phases[2].current = zeroIfNan(pzem3.current());
+  phases[2].power = zeroIfNan(pzem3.power());
+  phases[2].energy = zeroIfNan(pzem3.energy());
+  phases[2].frequency = zeroIfNan(pzem3.frequency());
+  phases[2].pf = zeroIfNan(pzem3.pf());
+  phases[2].va = (phases[2].pf == 0) ? 0 : phases[2].power / phases[2].pf;
+  phases[2].VAR = (phases[2].pf == 0) ? 0 : phases[2].power / phases[2].pf * sqrt(1-sq(phases[2].pf));
+
+  // Calculate total power
+  totalPower = phases[0].power + phases[1].power + phases[2].power;
 }
 
 void calculate3PhaseValues() {
-  voltage3ph = sqrt(sq(voltage1) + sq(voltage2) + sq(voltage3));
+  // Voltage calculation
+  threePhase.voltage = sqrt(sq(phases[0].voltage) + sq(phases[1].voltage) + sq(phases[2].voltage));
   
-  if (current1 > 0 && current2 > 0 && current3 > 0) {
-    current3ph = 0.3333 * (current1 + current2 + current3);
-  } else if (current1 == 0 && current2 > 0 && current3 > 0) {
-    current3ph = 0.5 * (current2 + current3);
-  } else if (current1 > 0 && current2 == 0 && current3 > 0) {
-    current3ph = 0.5 * (current1 + current3);
-  } else if (current1 > 0 && current2 > 0 && current3 == 0) {
-    current3ph = 0.5 * (current1 + current2);
-  } else if (current1 > 0 && current2 == 0 && current3 == 0) {
-    current3ph = current1;
-  } else if (current1 == 0 && current2 > 0 && current3 == 0) {
-    current3ph = current2;
-  } else if (current1 == 0 && current2 == 0 && current3 > 0) {
-    current3ph = current3;
-  } else {
-    current3ph = 0;
+  // Current calculation (average of active phases)
+  int activePhases = 0;
+  float currentSum = 0;
+  for (int i = 0; i < 3; i++) {
+    if (phases[i].current > 0) {
+      currentSum += phases[i].current;
+      activePhases++;
+    }
   }
+  threePhase.current = (activePhases > 0) ? currentSum / activePhases : 0;
 
-  power3ph = (power1 + power2 + power3);
-  energy3ph = (energy1 + energy2 + energy3);
-  va3ph = (va1 + va2 + va3);
-  VAR3ph = (VAR1 + VAR2 + VAR3);
+  // Power and energy (sum of all phases)
+  threePhase.power = phases[0].power + phases[1].power + phases[2].power;
+  threePhase.energy = phases[0].energy + phases[1].energy + phases[2].energy;
+  threePhase.va = phases[0].va + phases[1].va + phases[2].va;
+  threePhase.VAR = phases[0].VAR + phases[1].VAR + phases[2].VAR;
 
-  if (frequency1 > 0 && frequency2 > 0 && frequency3 > 0) {
-    frequency3ph = 0.3333 * (frequency1 + frequency2 + frequency3);
-  } else if (frequency1 > 0 && frequency2 > 0 && frequency3 == 0) {
-    frequency3ph = 0.5 * (frequency1 + frequency2);
-  } else if (frequency1 > 0 && frequency2 == 0 && frequency3 > 0) {
-    frequency3ph = 0.5 * (frequency1 + frequency3);
-  } else if (frequency1 == 0 && frequency2 > 0 && frequency3 > 0) {
-    frequency3ph = 0.5 * (frequency2 + frequency3);
-  } else if (frequency1 > 0 && frequency2 == 0 && frequency3 == 0) {
-    frequency3ph = frequency1;
-  } else if (frequency1 == 0 && frequency2 > 0 && frequency3 == 0) {
-    frequency3ph = frequency2;
-  } else if (frequency1 == 0 && frequency2 == 0 && frequency3 > 0) {
-    frequency3ph = frequency3;
-  } else {
-    frequency3ph = 0;
+  // Frequency (average of active phases)
+  activePhases = 0;
+  float frequencySum = 0;
+  for (int i = 0; i < 3; i++) {
+    if (phases[i].frequency > 0) {
+      frequencySum += phases[i].frequency;
+      activePhases++;
+    }
   }
+  threePhase.frequency = (activePhases > 0) ? frequencySum / activePhases : 0;
 
-  if (pf1 > 0 && pf2 > 0 && pf3 > 0) {
-    pf3ph = 0.3333 * (pf1 + pf2 + pf3);
-  } else if (pf1 > 0 && pf2 > 0 && pf3 == 0) {
-    pf3ph = 0.5 * (pf1 + pf2);
-  } else if (pf1 > 0 && pf2 == 0 && pf3 > 0) {
-    pf3ph = 0.5 * (pf1 + pf3);
-  } else if (pf1 == 0 && pf2 > 0 && pf3 > 0) {
-    pf3ph = 0.5 * (pf2 + pf3);
-  } else if (pf1 > 0 && pf2 == 0 && pf3 == 0) {
-    pf3ph = pf1;
-  } else if (pf1 == 0 && pf2 > 0 && pf3 == 0) {
-    pf3ph = pf2;
-  } else if (pf1 == 0 && pf2 == 0 && pf3 > 0) {
-    pf3ph = pf3;
+  // Power factor (average of active phases)
+  activePhases = 0;
+  float pfSum = 0;
+  for (int i = 0; i < 3; i++) {
+    if (phases[i].pf > 0) {
+      pfSum += phases[i].pf;
+      activePhases++;
+    }
+  }
+  threePhase.pf = (activePhases > 0) ? pfSum / activePhases : 0;
+}
+
+void sendCompleteDataToMQTT() {
+  DynamicJsonDocument doc(2048);
+  
+  // Phase R Data
+  doc["phase_r"] = phases[0].voltage;
+  doc["current_r"] = phases[0].current;
+  doc["power_r"] = phases[0].power;
+  doc["energy_r"] = phases[0].energy;
+  doc["frequency_r"] = phases[0].frequency;
+  doc["pf_r"] = phases[0].pf;
+  doc["va_r"] = phases[0].va;
+  doc["var_r"] = phases[0].VAR;
+
+  // Phase S Data
+  doc["phase_s"] = phases[1].voltage;
+  doc["current_s"] = phases[1].current;
+  doc["power_s"] = phases[1].power;
+  doc["energy_s"] = phases[1].energy;
+  doc["frequency_s"] = phases[1].frequency;
+  doc["pf_s"] = phases[1].pf;
+  doc["va_s"] = phases[1].va;
+  doc["var_s"] = phases[1].VAR;
+
+  // Phase T Data
+  doc["phase_t"] = phases[2].voltage;
+  doc["current_t"] = phases[2].current;
+  doc["power_t"] = phases[2].power;
+  doc["energy_t"] = phases[2].energy;
+  doc["frequency_t"] = phases[2].frequency;
+  doc["pf_t"] = phases[2].pf;
+  doc["va_t"] = phases[2].va;
+  doc["var_t"] = phases[2].VAR;
+
+  // Three Phase Data
+  doc["voltage_3ph"] = threePhase.voltage;
+  doc["current_3ph"] = threePhase.current;
+  doc["power_3ph"] = threePhase.power;
+  doc["energy_3ph"] = threePhase.energy;
+  doc["frequency_3ph"] = threePhase.frequency;
+  doc["pf_3ph"] = threePhase.pf;
+  doc["va_3ph"] = threePhase.va;
+  doc["var_3ph"] = threePhase.VAR;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  if (mqttClient.publish(mqtt_topic, payload.c_str(), true)) {
+    Serial.println("MQTT message published successfully");
+    Serial.println(payload);
   } else {
-    pf3ph = 0;
+    Serial.println("Failed to publish MQTT message");
   }
 }
+
+// [Rest of the functions remain exactly the same as in the previous code]
+// checkPowerStatus(), createStatusMessage(), sendPowerNotification(), 
+// sendWhatsAppNotification(), getCurrentTime(), sendToWhatsApp(), 
+// urlEncode(), reconnectMQTT(), checkTelegramMessages(), 
+// handleNewMessages(), updateStatusIndicators(), zeroIfNan()
 
 void checkPowerStatus() {
-  // Check R phase
-  if (voltage1 < 100) {  // Power is out
-    if (!powerOutNotificationSentR) {
-      String statusMessage = getPowerStatusMessage("R", voltage1, "S", voltage2, "T", voltage3);
-      sendPowerOutNotification("R", statusMessage);
-      sendWhatsAppNotification(statusMessage, false);
-      powerOutNotificationSentR = true;
-      powerRestoredNotificationSentR = false;
-    }
-  } else {  // Power is back
-    if (powerOutNotificationSentR && !powerRestoredNotificationSentR) {
-      String statusMessage = getPowerStatusMessage("R", voltage1, "S", voltage2, "T", voltage3);
-      sendPowerRestoredNotification("R", statusMessage);
-      sendWhatsAppNotification(statusMessage, true);
-      powerRestoredNotificationSentR = true;
-      powerOutNotificationSentR = false;
+  const char* phaseNames[] = {"R", "S", "T"};
+  bool currentOutage = false;
+  unsigned long currentMillis = millis();
+
+  for (int i = 0; i < 3; i++) {
+    if (phases[i].voltage < 100) {  // Power is out
+      currentOutage = true;
+      
+      if (!powerOutNotificationSent[i]) {
+        // First notification for this phase outage
+        String statusMessage = createStatusMessage();
+        sendPowerNotification(phaseNames[i], statusMessage, false);
+        sendWhatsAppNotification(statusMessage, false);
+        powerOutNotificationSent[i] = true;
+        powerRestoredNotificationSent[i] = false;
+        lastPowerOutNotify = currentMillis;
+      } 
+      else if (currentMillis - lastPowerOutNotify >= powerOutNotifyInterval) {
+        // Subsequent notifications during ongoing outage (Telegram only)
+        String statusMessage = createStatusMessage();
+        sendPowerNotification(phaseNames[i], statusMessage, false);
+        lastPowerOutNotify = currentMillis;
+      }
+    } 
+    else {  // Power is back
+      if (powerOutNotificationSent[i] && !powerRestoredNotificationSent[i]) {
+        // Power restored notification (both Telegram and WhatsApp)
+        String statusMessage = createStatusMessage();
+        sendPowerNotification(phaseNames[i], statusMessage, true);
+        sendWhatsAppNotification(statusMessage, true);
+        powerRestoredNotificationSent[i] = true;
+        powerOutNotificationSent[i] = false;
+      }
     }
   }
 
-  // Check S phase
-  if (voltage2 < 100) {
-    if (!powerOutNotificationSentS) {
-      String statusMessage = getPowerStatusMessage("S", voltage2, "R", voltage1, "T", voltage3);
-      sendPowerOutNotification("S", statusMessage);
-      sendWhatsAppNotification(statusMessage, false);
-      powerOutNotificationSentS = true;
-      powerRestoredNotificationSentS = false;
-    }
-  } else {
-    if (powerOutNotificationSentS && !powerRestoredNotificationSentS) {
-      String statusMessage = getPowerStatusMessage("S", voltage2, "R", voltage1, "T", voltage3);
-      sendPowerRestoredNotification("S", statusMessage);
-      sendWhatsAppNotification(statusMessage, true);
-      powerRestoredNotificationSentS = true;
-      powerOutNotificationSentS = false;
-    }
-  }
-
-  // Check T phase
-  if (voltage3 < 100) {
-    if (!powerOutNotificationSentT) {
-      String statusMessage = getPowerStatusMessage("T", voltage3, "R", voltage1, "S", voltage2);
-      sendPowerOutNotification("T", statusMessage);
-      sendWhatsAppNotification(statusMessage, false);
-      powerOutNotificationSentT = true;
-      powerRestoredNotificationSentT = false;
-    }
-  } else {
-    if (powerOutNotificationSentT && !powerRestoredNotificationSentT) {
-      String statusMessage = getPowerStatusMessage("T", voltage3, "R", voltage1, "S", voltage2);
-      sendPowerRestoredNotification("T", statusMessage);
-      sendWhatsAppNotification(statusMessage, true);
-      powerRestoredNotificationSentT = true;
-      powerOutNotificationSentT = false;
-    }
-  }
+  powerOutage = currentOutage;
 }
 
-String getPowerStatusMessage(String mainPhase, float mainVoltage, String phase1, float voltage1, String phase2, float voltage2) {
-  String message = "";
+String createStatusMessage() {
+  String message = "⚡️ STATUS LISTRIK ⚡️\n";
+  message += "🆁: " + String(phases[0].voltage, 1) + "V, " + String(phases[0].current, 2) + "A\n";
+  message += "🆂: " + String(phases[1].voltage, 1) + "V, " + String(phases[1].current, 2) + "A\n";
+  message += "🆃: " + String(phases[2].voltage, 1) + "V, " + String(phases[2].current, 2) + "A\n";
+  message += "🔌 Total: " + String(totalPower, 1) + "W\n\n";
   
-  // Status fase utama
-  message += "⚡️ Fase " + mainPhase + ": " + String(mainVoltage, 1) + " V\n";
-  
-  // Status fase lainnya
-  message += "⚡️ Fase " + phase1 + ": " + String(voltage1, 1) + " V\n";
-  message += "⚡️ Fase " + phase2 + ": " + String(voltage2, 1) + " V\n";
-  
-  // Total daya 3 fase
-  message += "🔌 Total Daya: " + String(power1 + power2 + power3, 1) + " W\n";
+  message += "📡 STATUS PERANGKAT:\n";
+  message += "📶 WiFi: " + String(WiFi.RSSI()) + "dBm\n";
+  message += "🌐 IP: " + WiFi.localIP().toString() + "\n";
+  message += "🔗 MQTT: " + String(mqttClient.connected() ? "Terhubung" : "Terputus") + "\n";
+  message += "🕒 " + getCurrentTime();
   
   return message;
 }
 
-void sendPowerOutNotification(String phase, String message) {
-  bot.sendChatAction(idChat, "Sedang mengetik...");
-  String fullMessage = "⚠️ LISTRIK PADAM! ⚠️\n";
-  fullMessage += "Fase " + phase + " mengalami pemadaman\n\n";
+void sendPowerNotification(String phase, String message, bool restored) {
+  bot.sendChatAction(idChat, "typing");
+  String fullMessage = restored ? "✅ LISTRIK KEMBALI NORMAL ✅\n" : "⚠️ LISTRIK PADAM! ⚠️\n";
+  fullMessage += "\nℹ Fase " + phase + (restored ? " Telah Pulih\n\n" : " Padam\n\n");
   fullMessage += message;
-  bot.sendMessage(idChat, fullMessage, "");
-}
-
-void sendPowerRestoredNotification(String phase, String message) {
-  bot.sendChatAction(idChat, "Sedang mengetik...");
-  String fullMessage = "✅ LISTRIK KEMBALI NORMAL ✅\n";
-  fullMessage += "Fase " + phase + " telah pulih\n\n";
-  fullMessage += message;
-  bot.sendMessage(idChat, fullMessage, "");
+  
+  if (bot.sendMessage(idChat, fullMessage, "")) {
+    Serial.println("Telegram notification sent successfully");
+  } else {
+    Serial.println("Failed to send Telegram notification");
+  }
 }
 
 void sendWhatsAppNotification(String message, bool restored) {
-  String fullMessage;
+  static bool firstOutageNotificationSent = false;
+  
   if (restored) {
-    fullMessage = "✅ LISTRIK KEMBALI NORMAL ✅\n\n";
-  } else {
-    fullMessage = "⚠️ LISTRIK PADAM! ⚠️\n\n";
-  }
-  fullMessage += message;
-  fullMessage += "\n🕒 " + getCurrentTime();
-
-  // Send to all WhatsApp numbers
-  for (int i = 0; i < sizeof(whatsappNumbers)/sizeof(whatsappNumbers[0]); i++) {
-    sendToWhatsApp(whatsappNumbers[i], whatsappApiKeys[i], fullMessage);
-    delay(2000); // Delay lebih panjang antara pengiriman
+    String fullMessage = "✅ LISTRIK KEMBALI NORMAL ✅\n\n";
+    fullMessage += message;
+    
+    Serial.println("Attempting to send WhatsApp restoration notification...");
+    for (int i = 0; i < sizeof(whatsappNumbers)/sizeof(whatsappNumbers[0]); i++) {
+      bool success = sendToWhatsApp(whatsappNumbers[i], whatsappApiKeys[i], fullMessage);
+      Serial.print("WhatsApp to ");
+      Serial.print(whatsappNumbers[i]);
+      Serial.println(success ? " - SUCCESS" : " - FAILED");
+      delay(2000);
+    }
+    firstOutageNotificationSent = false;
+  } 
+  else if (!firstOutageNotificationSent) {
+    String fullMessage = "⚠️ LISTRIK PADAM! ⚠️\n\n";
+    fullMessage += message;
+    
+    Serial.println("Attempting to send WhatsApp outage notification...");
+    for (int i = 0; i < sizeof(whatsappNumbers)/sizeof(whatsappNumbers[0]); i++) {
+      bool success = sendToWhatsApp(whatsappNumbers[i], whatsappApiKeys[i], fullMessage);
+      Serial.print("WhatsApp to ");
+      Serial.print(whatsappNumbers[i]);
+      Serial.println(success ? " - SUCCESS" : " - FAILED");
+      delay(2000);
+    }
+    firstOutageNotificationSent = true;
   }
 }
 
 String getCurrentTime() {
   time_t now = time(nullptr);
-  struct tm* timeinfo;
-  timeinfo = localtime(&now);
+  struct tm* timeinfo = localtime(&now);
   
   char timeString[20];
   strftime(timeString, sizeof(timeString), "%H:%M:%S %d/%m/%Y", timeinfo);
   return String(timeString);
 }
 
-void sendToWhatsApp(String phoneNumber, String apiKey, String message) {
-  if (WiFi.status() == WL_CONNECTED) {
-    WiFiClientSecure client;
-    HTTPClient https;
-    
-    client.setInsecure();
-    
-    String encodedMessage = urlEncode(message);
-    
-    String url = "https://api.callmebot.com/whatsapp.php?phone=" + phoneNumber + 
-                 "&text=" + encodedMessage + "&apikey=" + apiKey;
-    
-    Serial.println("Attempting to connect to: " + url);
-    
-    if (https.begin(client, url)) {
-      int httpCode = https.GET();
-      
-      if (httpCode > 0) {
-        String payload = https.getString();
-        Serial.println("WhatsApp notification sent to " + phoneNumber);
-        Serial.println("Response code: " + String(httpCode));
-        Serial.println("Response: " + payload);
-      } else {
-        Serial.println("Error sending WhatsApp notification to " + phoneNumber);
-        Serial.println("HTTP error code: " + String(httpCode));
-        Serial.println("Error: " + https.errorToString(httpCode));
-      }
-      
-      https.end();
-    } else {
-      Serial.println("Unable to begin HTTPS connection");
-    }
-  } else {
-    Serial.println("WiFi not connected, cannot send WhatsApp notification");
+bool sendToWhatsApp(String phoneNumber, String apiKey, String message) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WhatsApp send failed - WiFi not connected");
+    return false;
   }
+
+  WiFiClientSecure client;
+  HTTPClient https;
+  
+  client.setInsecure();
+  
+  String encodedMessage = urlEncode(message);
+  String url = "https://api.callmebot.com/whatsapp.php?phone=" + phoneNumber + 
+               "&text=" + encodedMessage + "&apikey=" + apiKey;
+  
+  Serial.print("Sending to URL: ");
+  Serial.println(url);
+
+  if (!https.begin(client, url)) {
+    Serial.println("WhatsApp send failed - HTTPS begin failed");
+    return false;
+  }
+
+  int httpCode = https.GET();
+  String payload = https.getString();
+  https.end();
+
+  Serial.print("HTTP Response code: ");
+  Serial.println(httpCode);
+  Serial.print("Response payload: ");
+  Serial.println(payload);
+
+  return (httpCode == HTTP_CODE_OK && payload.indexOf("success") >= 0);
 }
 
 String urlEncode(String str) {
   String encodedString = "";
-  char c;
-  char code0;
-  char code1;
-  
   for (unsigned int i = 0; i < str.length(); i++) {
-    c = str.charAt(i);
-    
-    if (c == ' ') {
-      encodedString += '+';
-    } else if (isalnum(c)) {
+    char c = str.charAt(i);
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
       encodedString += c;
+    } else if (c == ' ') {
+      encodedString += '+';
     } else {
-      code1 = (c & 0xf) + '0';
-      if ((c & 0xf) > 9) {
-        code1 = (c & 0xf) - 10 + 'A';
-      }
-      c = (c >> 4) & 0xf;
-      code0 = c + '0';
-      if (c > 9) {
-        code0 = c - 10 + 'A';
-      }
-      encodedString += '%';
-      encodedString += code0;
-      encodedString += code1;
+      char hex[4];
+      sprintf(hex, "%%%02X", c);
+      encodedString += hex;
     }
   }
   return encodedString;
 }
 
-void sendToMQTT() {
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-    delay(100);
-  }
-  
-  DynamicJsonDocument doc(2048);
-  
-  doc["phase_r"] = voltage1;
-  doc["phase_s"] = voltage2;
-  doc["phase_t"] = voltage3;
-  
-  doc["current_r"] = current1;
-  doc["current_s"] = current2;
-  doc["current_t"] = current3;
-  
-  doc["power_r"] = power1;
-  doc["power_s"] = power2;
-  doc["power_t"] = power3;
-  
-  doc["energy_r"] = energy1;
-  doc["energy_s"] = energy2;
-  doc["energy_t"] = energy3;
-  
-  doc["frequency_r"] = frequency1;
-  doc["frequency_s"] = frequency2;
-  doc["frequency_t"] = frequency3;
-  
-  doc["pf_r"] = pf1;
-  doc["pf_s"] = pf2;
-  doc["pf_t"] = pf3;
-  
-  doc["va_r"] = va1;
-  doc["va_s"] = va2;
-  doc["va_t"] = va3;
-  
-  doc["var_r"] = VAR1;
-  doc["var_s"] = VAR2;
-  doc["var_t"] = VAR3;
-  
-  // Data 3 phase
-  doc["voltage_3ph"] = voltage3ph;
-  doc["current_3ph"] = current3ph;
-  doc["power_3ph"] = power3ph;
-  doc["energy_3ph"] = energy3ph;
-  doc["frequency_3ph"] = frequency3ph;
-  doc["pf_3ph"] = pf3ph;
-  doc["va_3ph"] = va3ph;
-  doc["var_3ph"] = VAR3ph;
-
-  String payload;
-  serializeJson(doc, payload);
-
-  if (mqttClient.publish(mqtt_topic, payload.c_str(), false)) {
-    Serial.println("MQTT message published successfully");
-    Serial.println(payload);
-  } else {
-    Serial.println("Failed to publish MQTT message. State: " + String(mqttClient.state()));
-  }
-}
-
 void reconnectMQTT() {
-  while (!mqttClient.connected()) {
+  if (!mqttClient.connected()) {
     Serial.print("Attempting MQTT connection...");
     
     String clientId = "ESP8266Client-";
@@ -493,41 +468,74 @@ void reconnectMQTT() {
     
     if (mqttClient.connect(clientId.c_str())) {
       Serial.println("connected");
+      mqttConnected = true;
+      lastMqttState = true;
     } else {
       Serial.print("failed, rc=");
       Serial.print(mqttClient.state());
-      Serial.println(" try again in 5 seconds");
-      delay(5000);
+      mqttConnected = false;
+      lastMqttState = false;
     }
   }
 }
 
-float zeroIfNan(float v) {
-  return isnan(v) ? 0 : v;
+void checkTelegramMessages() {
+  int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+  
+  while(numNewMessages) {
+    handleNewMessages(numNewMessages);
+    numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+  }
 }
 
-void handleNewMessages(int numNewMessages, float v1, float v2, float v3) {
-  Serial.println("handleNewMessages");
-  Serial.println(String(numNewMessages));
-
-  for (int i=0; i<numNewMessages; i++) {
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
     String chat_id = String(bot.messages[i].chat_id);
     String text = bot.messages[i].text;
     String from_name = bot.messages[i].from_name;
     if (from_name == "") from_name = "Guest";
  
     if (text == "/listrik") {
-      String temp = "● Listrik NOC :\n";
-      temp += "⚡️ 🆁 : " + String(int(v1)) + " V\n";
-      temp += "⚡️ 🆂 : " + String(int(v2)) + " V\n";
-      temp += "⚡️ 🆃 : " + String(int(v3)) + " V\n";
-      bot.sendMessage(chat_id, temp, "");
+      bot.sendMessage(chat_id, createStatusMessage(), "");
     }
-
-    if (text == "/start") {
+    else if (text == "/start") {
       String welcome = "Hi " + from_name + ", pilih pengecekan:\n";
-      welcome += "⚡️ /listrik  (Status Listrik)\n";
+      welcome += "⚡️ /listrik (Status Listrik)\n";
+      welcome += "🌡️ /suhu (Status Suhu NOC)\n";
+      welcome += "🌡️ /suhu2 (Status Suhu R. UPS)";
       bot.sendMessage(chat_id, welcome, "");
     }
   }
+}
+
+void updateStatusIndicators() {
+  unsigned long currentMillis = millis();
+
+  // Handle MQTT connection status LED
+  if (!mqttClient.connected()) {
+    if (currentMillis - lastMqttBlink >= mqttBlinkInterval) {
+      digitalWrite(LED_GREEN_PIN, !digitalRead(LED_GREEN_PIN));
+      lastMqttBlink = currentMillis;
+    }
+  } else {
+    digitalWrite(LED_GREEN_PIN, !powerOutage);
+  }
+
+  // Handle power outage indicators
+  if (powerOutage) {
+    digitalWrite(LED_RED_PIN, HIGH);
+    if (currentMillis - lastBuzzerToggle >= 1000) {
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState);
+      lastBuzzerToggle = currentMillis;
+    }
+  } else {
+    digitalWrite(LED_RED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerState = false;
+  }
+}
+
+float zeroIfNan(float v) {
+  return isnan(v) ? 0 : v;
 }
